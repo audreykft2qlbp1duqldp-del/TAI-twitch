@@ -1,10 +1,10 @@
-name: Twitch → Drive (STREAM no-disk, OAuth, clip time)
+name: Twitch → Drive (STREAM no-disk, OAuth)
 
 on:
   workflow_dispatch:
     inputs:
       quality:
-        description: "Chọn độ phân giải"
+        description: "Chọn độ phân giải tải về"
         type: choice
         options: [best, 1080p, 720p, 480p, 360p]
         default: best
@@ -14,14 +14,6 @@ on:
         type: boolean
         default: true
         required: true
-      start_at:
-        description: "Bắt đầu từ (HH:MM:SS). Mặc định 00:00:00"
-        default: "00:00:00"
-        required: false
-      duration:
-        description: 'Thời lượng (HH:MM:SS). Đặt "0" = toàn bộ'
-        default: "0"
-        required: false
 
 jobs:
   run:
@@ -32,8 +24,6 @@ jobs:
 
     env:
       QUALITY: ${{ inputs.quality }}
-      START_AT: ${{ inputs.start_at }}
-      DURATION: ${{ inputs.duration }}
 
     steps:
       - name: Checkout
@@ -103,7 +93,7 @@ jobs:
           chmod 600 rclone.conf
 
       # =========================
-      # A) STREAM trực tiếp → Drive (không dùng đĩa)
+      # A) STREAM thẳng → Drive
       # =========================
       - name: STREAM Twitch → ffmpeg → rclone rcat (no disk)
         if: ${{ steps.pick.outputs.selected_url != '' && inputs.stream_to_drive }}
@@ -111,8 +101,6 @@ jobs:
         env:
           URL: ${{ steps.pick.outputs.selected_url }}
           QUALITY: ${{ env.QUALITY }}
-          START_AT: ${{ env.START_AT }}
-          DURATION: ${{ env.DURATION }}
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -euo pipefail
@@ -134,24 +122,16 @@ jobs:
           # Lấy URL stream (1 hoặc 2 dòng: video, audio)
           mapfile -t URLS < <(yt-dlp -g -f "$FILTER" "$URL")
 
-          # Tham số cắt
-          IN_SS=""
-          OUT_T=()
-          if [[ -n "$START_AT" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
-            IN_SS="-ss $START_AT"
-          fi
-          if [[ -n "$DURATION" && "$DURATION" != "0" ]]; then
-            OUT_T=(-t "$DURATION")
-          fi
+          # HLS reconnect args cho ffmpeg
+          RECON=" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
 
           if [ "${#URLS[@]}" -ge 2 ]; then
             VURL="${URLS[0]}"; AURL="${URLS[1]}"
             echo "[INFO] Using separate V/A URLs"
             ffmpeg -hide_banner -loglevel error \
-              $IN_SS -i "$VURL" $IN_SS -i "$AURL" \
+              -i "$VURL" -i "$AURL" \
               -map 0:v:0 -map 1:a:0 \
               -c copy -bsf:a aac_adtstoasc -movflags +faststart \
-              "${OUT_T[@]}" \
               -f mp4 - \
             | rclone rcat "$REMOTE" \
                 --drive-chunk-size 64M --transfers 1 --checkers 4 --progress
@@ -159,24 +139,22 @@ jobs:
             ONE="${URLS[0]}"
             echo "[INFO] Using single URL"
             ffmpeg -hide_banner -loglevel error \
-              $IN_SS -i "$ONE" \
+              -i "$ONE" \
               -c copy -bsf:a aac_adtstoasc -movflags +faststart \
-              "${OUT_T[@]}" \
               -f mp4 - \
             | rclone rcat "$REMOTE" \
                 --drive-chunk-size 64M --transfers 1 --checkers 4 --progress
           fi
 
       # =========================
-      # B) (tắt STREAM) TẢI VỀ rồi COPY
+      # B) (Tuỳ chọn) TẢI VỀ RỒI COPY
+      #    – chỉ dùng nếu tắt STREAM
       # =========================
       - name: Download to disk (yt-dlp → MP4)
         if: ${{ steps.pick.outputs.selected_url != '' && !inputs.stream_to_drive }}
         env:
           URL: ${{ steps.pick.outputs.selected_url }}
           QUALITY: ${{ env.QUALITY }}
-          START_AT: ${{ env.START_AT }}
-          DURATION: ${{ env.DURATION }}
         run: |
           set -e
           mkdir -p out
@@ -186,21 +164,9 @@ jobs:
             H="${QUALITY%p}"
             FILTER="bv*[height<=$H]+ba/b[height<=$H]/best"
           fi
-
-          # Nếu cần cắt khi tải về: dùng --download-sections của yt-dlp (chính xác với HLS)
-          DL_ARGS=()
-          if [[ -n "$DURATION" && "$DURATION" != "0" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
-            DL_ARGS+=(--download-sections "*${START_AT}-${DURATION}")
-          elif [[ -n "$DURATION" && "$DURATION" != "0" ]]; then
-            DL_ARGS+=(--download-sections "*0:00:00-${DURATION}")
-          elif [[ -n "$START_AT" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
-            # Không có cách đặt "đến hết" bằng --download-sections, nên sẽ tải full rồi ffmpeg cắt sau (nếu cần).
-            :
-          fi
-
           yt-dlp -N 8 --concurrent-fragments 16 --fragment-retries 100 --retry-sleep 2 \
             --no-part --remux-video mp4 \
-            -f "$FILTER" "${DL_ARGS[@]}" \
+            -f "$FILTER" \
             -o "out/%(uploader)s_%(title).180B_%(id)s.%(ext)s" \
             "$URL"
 
@@ -212,7 +178,7 @@ jobs:
           set -e
           rclone copy "out" "gdrive:" --transfers 8 --checkers 16 --drive-chunk-size 64M \
             --ignore-existing --stats 30s --stats-file-name-length 0 --retries 5 --low-level-retries 10
-          rm -rf out  # giải phóng đĩa
+          rm -rf out  # giải phóng đĩa ngay
 
       - name: Append processed link to linkdalay.csv & push
         if: ${{ steps.pick.outputs.selected_url != '' }}
