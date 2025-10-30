@@ -1,7 +1,16 @@
-name: Twitch → Drive (low-quality, 1h30, clean MP4)
+name: Twitch → Drive (low-quality, custom time, clean MP4)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      start_at:
+        description: "Bắt đầu từ (HH:MM:SS). Ví dụ 00:00:00"
+        default: "00:00:00"
+        required: false
+      duration:
+        description: 'Thời lượng cần tải (HH:MM:SS). Đặt "0" = lấy hết'
+        default: "01:30:00"
+        required: false
 
 jobs:
   run:
@@ -9,6 +18,10 @@ jobs:
     timeout-minutes: 720
     permissions:
       contents: write
+
+    env:
+      START_AT: ${{ inputs.start_at }}
+      DURATION: ${{ inputs.duration }}
 
     steps:
       - name: Checkout
@@ -68,7 +81,6 @@ jobs:
           set -e
           [ -n "$GDRIVE_OAUTH_TOKEN_JSON" ] || { echo "Thiếu GDRIVE_OAUTH_TOKEN_JSON"; exit 1; }
           TOKEN=$(printf "%s" "$GDRIVE_OAUTH_TOKEN_JSON" | tr -d '\n')
-
           {
             echo "[gdrive]"
             echo "type = drive"
@@ -77,11 +89,10 @@ jobs:
             [ -n "$GDRIVE_CLIENT_SECRET" ] && echo "client_secret = $GDRIVE_CLIENT_SECRET"
             echo "token = $TOKEN"
             [ -n "$GDRIVE_FOLDER_ID" ] && echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-            # đi vừa phải để bớt 429
+            # đi chậm để tránh 429
             echo "pacer_min_sleep = 500ms"
             echo "pacer_burst = 5"
           } > rclone.conf
-
           [ -n "$TEAM_DRIVE_ID" ] && echo "team_drive = ${TEAM_DRIVE_ID}" >> rclone.conf
           chmod 600 rclone.conf
 
@@ -95,39 +106,45 @@ jobs:
           rclone mkdir "$TMP" --stats 5s --progress
           rclone purge "$TMP" || true
 
-      - name: Download & transcode from Twitch → clean MP4 (1h30, lowest quality)
+      - name: Twitch → ffmpeg → MP4 (low, custom time)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
           URL: ${{ steps.pick.outputs.selected_url }}
+          START_AT: ${{ env.START_AT }}
+          DURATION: ${{ env.DURATION }}
         run: |
           set -euo pipefail
           mkdir -p out_final
 
-          # 1) Lấy tên để đặt file
+          # Lấy tên để đặt file
           NAME="$(yt-dlp --print "%(uploader)s_%(title).180B_%(id)s" "$URL" | head -n1)"
           SAFE="$(printf '%s' "$NAME" | tr -d '\n' | sed 's#[/<>:"\\|?*]#_#g')"
           OUT="out_final/${SAFE}.mp4"
-
           echo "[INFO] Output file: $OUT"
 
-          # 2) Lấy URL chất lượng THẤP NHẤT để tải nhanh nhất
-          #    "worst" = rẻ nhất Twitch cho bạn
-          RAW_URLS=()
+          # Lấy link lowest quality từ Twitch
           mapfile -t RAW_URLS < <(yt-dlp -g -f "worst" "$URL")
           if [ "${#RAW_URLS[@]}" -eq 0 ]; then
             echo "Không lấy được URL HLS từ Twitch"; exit 1
           fi
-
           SRC="${RAW_URLS[0]}"
-
           echo "[INFO] Source (worst): $SRC"
 
-          # 3) ffmpeg: hút 1h30 (01:30:00), scale 480p, H.264, AAC, mp4 sạch
-          #    -loglevel info -stats để bạn THẤY tiến trình
+          # build tham số thời gian
+          SS_ARGS=()
+          T_ARGS=()
+          if [[ -n "$START_AT" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
+            SS_ARGS=(-ss "$START_AT")
+          fi
+          if [[ -n "$DURATION" && "$DURATION" != "0" ]]; then
+            T_ARGS=(-t "$DURATION")
+          fi
+
+          # ffmpeg: encode sạch, nhẹ, 480p, 30fps
           ffmpeg -hide_banner -loglevel info -stats \
-            -ss 00:00:00 -i "$SRC" \
-            -t 01:30:00 \
+            "${SS_ARGS[@]}" -i "$SRC" \
+            "${T_ARGS[@]}" \
             -vf "scale=-2:480,fps=30" \
             -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 24 \
             -c:a aac -b:a 128k -ac 2 -ar 48000 \
@@ -143,7 +160,6 @@ jobs:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -e
-          # upload chậm chống 429, nhưng có progress
           rclone copy "out_final" "gdrive:" \
             --transfers 1 \
             --checkers 1 \
@@ -154,7 +170,6 @@ jobs:
             --progress \
             --retries 3 \
             --low-level-retries 10
-
           rm -rf out_final
 
       - name: Append processed link to linkdalay.csv & push
