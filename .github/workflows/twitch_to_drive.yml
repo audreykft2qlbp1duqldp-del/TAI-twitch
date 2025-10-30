@@ -1,4 +1,4 @@
-name: Twitch → Drive (MP4 sạch tuyệt đối, re-encode)
+name: Twitch → Drive (MP4 sạch, có progress)
 
 on:
   workflow_dispatch:
@@ -17,6 +17,14 @@ on:
         description: 'Thời lượng (HH:MM:SS). Đặt "0" = toàn bộ'
         default: "0"
         required: false
+      upload_mode:
+        description: "Chế độ upload lên Drive"
+        type: choice
+        options:
+          - safe   # chậm nhưng ít bị 429
+          - fast   # nhanh nhưng dễ 429
+        default: safe
+        required: true
 
 jobs:
   run:
@@ -29,6 +37,7 @@ jobs:
       QUALITY: ${{ inputs.quality }}
       START_AT: ${{ inputs.start_at }}
       DURATION: ${{ inputs.duration }}
+      UPLOAD_MODE: ${{ inputs.upload_mode }}
 
     steps:
       - name: Checkout
@@ -56,13 +65,16 @@ jobs:
             url="$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             [ -z "$url" ] && continue
             [[ "$url" =~ ^# ]] && continue
-            if ! grep -Fqx -- "$url" linkdalay.csv; then NEXT_URL="$url"; break; fi
+            if ! grep -Fqx -- "$url" linkdalay.csv; then
+              NEXT_URL="$url"; break
+            fi
           done < link.csv
 
           if [ -z "$NEXT_URL" ]; then
             echo "selected_url=" >> $GITHUB_OUTPUT
             echo "Không còn link mới."; exit 0
           fi
+
           echo "Chọn link: $NEXT_URL"
           echo "selected_url=$NEXT_URL" >> $GITHUB_OUTPUT
 
@@ -73,15 +85,25 @@ jobs:
       - name: Configure rclone (Google Drive OAuth token)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         env:
-          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}   # phải có refresh_token
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}                 # nên có
-          TEAM_DRIVE_ID: ${{ secrets.TEAM_DRIVE_ID }}                       # optional
-          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}                 # optional
-          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}         # optional
+          GDRIVE_OAUTH_TOKEN_JSON: ${{ secrets.GDRIVE_OAUTH_TOKEN_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          TEAM_DRIVE_ID: ${{ secrets.TEAM_DRIVE_ID }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          UPLOAD_MODE: ${{ env.UPLOAD_MODE }}
         run: |
           set -e
           [ -n "$GDRIVE_OAUTH_TOKEN_JSON" ] || { echo "Thiếu GDRIVE_OAUTH_TOKEN_JSON"; exit 1; }
           TOKEN=$(printf "%s" "$GDRIVE_OAUTH_TOKEN_JSON" | tr -d '\n')
+
+          # default: safe
+          PACER_MIN_SLEEP="500ms"
+          PACER_BURST="5"
+          if [ "$UPLOAD_MODE" = "fast" ]; then
+            PACER_MIN_SLEEP="100ms"
+            PACER_BURST="20"
+          fi
+
           {
             echo "[gdrive]"
             echo "type = drive"
@@ -90,9 +112,10 @@ jobs:
             [ -n "$GDRIVE_CLIENT_SECRET" ] && echo "client_secret = $GDRIVE_CLIENT_SECRET"
             echo "token = $TOKEN"
             [ -n "$GDRIVE_FOLDER_ID" ] && echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-            echo "pacer_min_sleep = 10ms"
-            echo "pacer_burst = 200"
+            echo "pacer_min_sleep = ${PACER_MIN_SLEEP}"
+            echo "pacer_burst = ${PACER_BURST}"
           } > rclone.conf
+
           [ -n "$TEAM_DRIVE_ID" ] && echo "team_drive = ${TEAM_DRIVE_ID}" >> rclone.conf
           chmod 600 rclone.conf
 
@@ -103,10 +126,10 @@ jobs:
         run: |
           set -e
           TMP="gdrive:__probe_$RANDOM"
-          rclone mkdir "$TMP"
+          rclone mkdir "$TMP" --stats 5s --progress
           rclone purge "$TMP" || true
 
-      - name: Re-encode to CLEAN MP4 on disk (ffmpeg H.264 + AAC + faststart)
+      - name: Re-encode to CLEAN MP4 on disk (ffmpeg H.264 + AAC + faststart) with progress
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
@@ -118,26 +141,22 @@ jobs:
           set -euo pipefail
           mkdir -p out_final
 
-          # Lọc theo độ phân giải đầu vào (để lấy stream phù hợp)
           if [[ "$QUALITY" == "best" ]]; then
             FILTER='bestvideo*+bestaudio/best'
-            SCALE_FILTER=""   # không ép scale nếu chọn best
+            SCALE_FILTER=""
           else
             H="${QUALITY%p}"
             FILTER="bv*[height<=$H]+ba/b[height<=$H]/best"
             SCALE_FILTER="scale=-2:${H}"
           fi
 
-          # Lấy tên file sạch
           NAME="$(yt-dlp --print "%(uploader)s_%(title).180B_%(id)s" "$URL" | head -n1)"
           SAFE="$(printf '%s' "$NAME" | tr -d '\n' | sed 's#[/<>:"\\|?*]#_#g')"
           OUT="out_final/${SAFE}.mp4"
           echo "[INFO] Output file: $OUT"
 
-          # Lấy URL stream (1 hoặc 2 dòng: video, audio)
           mapfile -t URLS < <(yt-dlp -g -f "$FILTER" "$URL")
 
-          # Thời gian cắt
           IN_SS_ARGS=()
           OUT_T_ARGS=()
           if [[ -n "$START_AT" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
@@ -147,11 +166,6 @@ jobs:
             OUT_T_ARGS=(-t "$DURATION")
           fi
 
-          # Cài đặt encode "sạch tuyệt đối"
-          # - CFR 30fps, H.264 High@4.1, yuv420p
-          # - AAC-LC 160k, 48kHz, stereo
-          # - +faststart (moov ở đầu)
-          # - Nếu chọn chất lượng cố định (khác 'best') và cần scale thì thêm filter
           VF_ARGS=()
           if [[ -n "$SCALE_FILTER" ]]; then
             VF_ARGS=(-vf "${SCALE_FILTER},fps=30")
@@ -159,15 +173,19 @@ jobs:
             VF_ARGS=(-vf "fps=30")
           fi
 
-          COMMON_ENC=(-c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 20 \
-                      -c:a aac -b:a 160k -ac 2 -ar 48000 \
-                      -movflags +faststart \
-                      -max_muxing_queue_size 1024)
+          COMMON_ENC=(
+            -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 20
+            -c:a aac -b:a 160k -ac 2 -ar 48000
+            -movflags +faststart
+            -max_muxing_queue_size 1024
+          )
 
+          # ĐÂY: bật progress ffmpeg
+          # -loglevel info: in tiến trình
+          # -stats: hiển thị %/fps/size/bitrate cứ vài giây
           if [ "${#URLS[@]}" -ge 2 ]; then
             VURL="${URLS[0]}"; AURL="${URLS[1]}"
-            echo "[INFO] Re-encode from separate V/A URLs"
-            ffmpeg -hide_banner -loglevel error \
+            ffmpeg -hide_banner -loglevel info -stats \
               "${IN_SS_ARGS[@]}" -i "$VURL" "${IN_SS_ARGS[@]}" -i "$AURL" \
               -map 0:v:0 -map 1:a:0 \
               "${VF_ARGS[@]}" \
@@ -176,8 +194,7 @@ jobs:
               "$OUT"
           else
             ONE="${URLS[0]}"
-            echo "[INFO] Re-encode from single URL"
-            ffmpeg -hide_banner -loglevel error \
+            ffmpeg -hide_banner -loglevel info -stats \
               "${IN_SS_ARGS[@]}" -i "$ONE" \
               -map 0:v:0 -map 0:a:0? \
               "${VF_ARGS[@]}" \
@@ -186,19 +203,52 @@ jobs:
               "$OUT"
           fi
 
-          # In dung lượng để ước lượng còn trống
           ls -lh "$OUT"
 
-      - name: Upload MP4 to Google Drive (copy then cleanup)
+      - name: Upload MP4 to Google Drive (progress)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+          UPLOAD_MODE: ${{ env.UPLOAD_MODE }}
         run: |
           set -e
-          rclone copy "out_final" "gdrive:" \
-            --transfers 2 --checkers 8 --drive-chunk-size 64M \
-            --stats 30s --stats-file-name-length 0 \
-            --retries 5 --low-level-retries 10
+          # cấu hình cho 2 mode
+          if [ "$UPLOAD_MODE" = "fast" ]; then
+            TRANSFERS=2
+            CHECKERS=4
+            TPS=4
+            CHUNK=64M
+            SLEEP_BASE=20
+          else
+            TRANSFERS=1
+            CHECKERS=1
+            TPS=1
+            CHUNK=32M
+            SLEEP_BASE=60
+          fi
+
+          # upload với retry tăng dần và IN RA TIẾN TRÌNH mỗi 10s
+          for i in 1 2 3 4 5 6; do
+            echo "[UPLOAD] Lần $i ..."
+            rclone copy "out_final" "gdrive:" \
+              --transfers ${TRANSFERS} \
+              --checkers ${CHECKERS} \
+              --tpslimit ${TPS} \
+              --tpslimit-burst ${TPS} \
+              --drive-chunk-size ${CHUNK} \
+              --stats 10s \
+              --progress \
+              --retries 1 \
+              --low-level-retries 10 && break
+            # nếu bị 429 thì chờ
+            SLEEP=$((SLEEP_BASE * i))
+            echo "[UPLOAD] lỗi (có thể 429), chờ ${SLEEP}s rồi thử lại..."
+            sleep "$SLEEP"
+            if [ "$i" -eq 6 ]; then
+              echo "[UPLOAD] Hết lượt retry, vẫn lỗi."; exit 1
+            fi
+          done
+
           rm -rf out_final
 
       - name: Append processed link to linkdalay.csv & push
