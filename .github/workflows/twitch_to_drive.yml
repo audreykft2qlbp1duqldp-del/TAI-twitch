@@ -89,9 +89,8 @@ jobs:
             [ -n "$GDRIVE_CLIENT_SECRET" ] && echo "client_secret = $GDRIVE_CLIENT_SECRET"
             echo "token = $TOKEN"
             [ -n "$GDRIVE_FOLDER_ID" ] && echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-            # đi chậm để tránh 429
-            echo "pacer_min_sleep = 500ms"
-            echo "pacer_burst = 5"
+            echo "pacer_min_sleep = 2s"
+            echo "pacer_burst = 1"
           } > rclone.conf
           [ -n "$TEAM_DRIVE_ID" ] && echo "team_drive = ${TEAM_DRIVE_ID}" >> rclone.conf
           chmod 600 rclone.conf
@@ -117,13 +116,11 @@ jobs:
           set -euo pipefail
           mkdir -p out_final
 
-          # Lấy tên để đặt file
           NAME="$(yt-dlp --print "%(uploader)s_%(title).180B_%(id)s" "$URL" | head -n1)"
           SAFE="$(printf '%s' "$NAME" | tr -d '\n' | sed 's#[/<>:"\\|?*]#_#g')"
           OUT="out_final/${SAFE}.mp4"
           echo "[INFO] Output file: $OUT"
 
-          # Lấy link lowest quality từ Twitch
           mapfile -t RAW_URLS < <(yt-dlp -g -f "worst" "$URL")
           if [ "${#RAW_URLS[@]}" -eq 0 ]; then
             echo "Không lấy được URL HLS từ Twitch"; exit 1
@@ -131,7 +128,6 @@ jobs:
           SRC="${RAW_URLS[0]}"
           echo "[INFO] Source (worst): $SRC"
 
-          # build tham số thời gian
           SS_ARGS=()
           T_ARGS=()
           if [[ -n "$START_AT" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
@@ -141,7 +137,6 @@ jobs:
             T_ARGS=(-t "$DURATION")
           fi
 
-          # ffmpeg: encode sạch, nhẹ, 480p, 30fps
           ffmpeg -hide_banner -loglevel info -stats \
             "${SS_ARGS[@]}" -i "$SRC" \
             "${T_ARGS[@]}" \
@@ -154,23 +149,57 @@ jobs:
 
           ls -lh out_final
 
-      - name: Upload to Drive
+      - name: Upload to Drive (Anti-429 Optimized)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        shell: bash
         run: |
-          set -e
-          rclone copy "out_final" "gdrive:" \
-            --transfers 1 \
-            --checkers 1 \
-            --tpslimit 1 \
-            --tpslimit-burst 1 \
-            --drive-chunk-size 32M \
-            --stats 10s \
-            --progress \
-            --retries 3 \
-            --low-level-retries 10
-          rm -rf out_final
+          set -euo pipefail
+          echo "⏳ Chờ 5 phút trước upload để tránh Google rate-limit..."
+          sleep 300
+
+          UPLOAD_DIR="out_final"
+          MAX_RETRY=10
+          RETRY=0
+          DELAY=120
+
+          while [ $RETRY -lt $MAX_RETRY ]; do
+            echo "🚀 Upload lần $((RETRY+1)) (retry delay hiện tại: $DELAY giây)..."
+
+            rclone copy "$UPLOAD_DIR" "gdrive:" \
+              --transfers 1 \
+              --checkers 1 \
+              --bwlimit 8M \
+              --tpslimit 0.5 \
+              --tpslimit-burst 1 \
+              --drive-chunk-size 8M \
+              --drive-upload-cutoff 8M \
+              --max-backlog 1 \
+              --stats 30s \
+              --retries 3 \
+              --low-level-retries 20 \
+              --timeout 1h \
+              --contimeout 5m \
+              --progress
+
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "🎉 Upload hoàn tất thành công!"
+              rm -rf "$UPLOAD_DIR"
+              break
+            else
+              echo "⚠️ Upload lỗi (mã $EXIT_CODE). Ngủ $DELAY giây rồi thử lại..."
+              sleep $DELAY
+              RETRY=$((RETRY+1))
+              DELAY=$((DELAY * 2))  # tăng delay theo cấp số nhân
+            fi
+          done
+
+          if [ $RETRY -eq $MAX_RETRY ]; then
+            echo "❌ Thất bại sau $MAX_RETRY lần thử upload." >&2
+            exit 1
+          fi
 
       - name: Append processed link to linkdalay.csv & push
         if: ${{ steps.pick.outputs.selected_url != '' }}
