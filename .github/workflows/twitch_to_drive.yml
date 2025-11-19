@@ -1,15 +1,25 @@
-name: Twitch → Drive (low-quality, custom time, clean MP4)
+name: Twitch → Drive (low-quality, custom time, clean MP4, anti-429 segments)
 
 on:
   workflow_dispatch:
     inputs:
       start_at:
-        description: "Bắt đầu từ (HH:MM:SS). Ví dụ 00:00:00"
+        description: "Bắt đầu từ (ví dụ: 00:00:00 / 20m37s / 75s / 0)"
         default: "00:00:00"
         required: false
       duration:
-        description: 'Thời lượng cần tải (HH:MM:SS). Đặt "0" = lấy hết'
+        description: 'Thời lượng cần lấy (ví dụ: 01:30:00 / 20m37s / 0 = toàn bộ)'
         default: "01:30:00"
+        required: false
+      upload_strategy:
+        description: "Cách xuất để upload"
+        type: choice
+        options: [segments, single]
+        default: segments
+        required: true
+      segment_minutes:
+        description: "Độ dài mỗi phân đoạn (phút) khi chọn segments"
+        default: "10"
         required: false
 
 jobs:
@@ -22,12 +32,13 @@ jobs:
     env:
       START_AT: ${{ inputs.start_at }}
       DURATION: ${{ inputs.duration }}
+      UPLOAD_STRATEGY: ${{ inputs.upload_strategy }}
+      SEGMENT_MIN: ${{ inputs.segment_minutes }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Install tools
         run: |
@@ -37,6 +48,7 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install --upgrade yt-dlp
           curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
 
       - name: Pick next URL from link.csv (avoid duplicates)
         id: pick
@@ -51,15 +63,13 @@ jobs:
             [ -z "$url" ] && continue
             [[ "$url" =~ ^# ]] && continue
             if ! grep -Fqx -- "$url" linkdalay.csv; then
-              NEXT_URL="$url"
-              break
+              NEXT_URL="$url"; break
             fi
           done < link.csv
 
           if [ -z "$NEXT_URL" ]; then
             echo "selected_url=" >> $GITHUB_OUTPUT
-            echo "Không còn link mới."
-            exit 0
+            echo "Không còn link mới."; exit 0
           fi
 
           echo "selected_url=$NEXT_URL" >> $GITHUB_OUTPUT
@@ -89,7 +99,8 @@ jobs:
             [ -n "$GDRIVE_CLIENT_SECRET" ] && echo "client_secret = $GDRIVE_CLIENT_SECRET"
             echo "token = $TOKEN"
             [ -n "$GDRIVE_FOLDER_ID" ] && echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-            echo "pacer_min_sleep = 2s"
+            # nhịp chậm để giảm 429
+            echo "pacer_min_sleep = 1s"
             echo "pacer_burst = 1"
           } > rclone.conf
           [ -n "$TEAM_DRIVE_ID" ] && echo "team_drive = ${TEAM_DRIVE_ID}" >> rclone.conf
@@ -97,114 +108,158 @@ jobs:
 
       - name: Preflight Drive
         if: ${{ steps.pick.outputs.selected_url != '' }}
-        env:
-          RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+        env: { RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf }
         run: |
           set -e
           TMP="gdrive:__probe_$RANDOM"
-          rclone mkdir "$TMP" --stats 5s --progress
+          rclone mkdir "$TMP" --stats 5s --progress --disable-http2
           rclone purge "$TMP" || true
 
-      - name: Twitch → ffmpeg → MP4 (low, custom time)
+      - name: Twitch → ffmpeg (worst) → MP4 clean (single or segments)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
           URL: ${{ steps.pick.outputs.selected_url }}
           START_AT: ${{ env.START_AT }}
           DURATION: ${{ env.DURATION }}
+          UPLOAD_STRATEGY: ${{ env.UPLOAD_STRATEGY }}
+          SEGMENT_MIN: ${{ env.SEGMENT_MIN }}
         run: |
           set -euo pipefail
           mkdir -p out_final
 
+          norm_time () {
+            s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+            [ -z "$s" ] && { echo "0"; return; }
+            [ "$s" = "0" ] && { echo "0"; return; }
+            if [[ "$s" =~ ^[0-9]+:[0-9]{2}:[0-9]{2}$ ]]; then echo "$s"; return; fi
+            local h=0 m=0 sec=0
+            if   [[ "$s" =~ ^([0-9]+)h([0-9]+)m([0-9]+)s$ ]]; then h=${BASH_REMATCH[1]}; m=${BASH_REMATCH[2]}; sec=${BASH_REMATCH[3]}
+            elif [[ "$s" =~ ^([0-9]+)m([0-9]+)s$ ]]; then m=${BASH_REMATCH[1]}; sec=${BASH_REMATCH[2]}
+            elif [[ "$s" =~ ^([0-9]+)h([0-9]+)m$ ]]; then h=${BASH_REMATCH[1]}; m=${BASH_REMATCH[2]}
+            elif [[ "$s" =~ ^([0-9]+)h([0-9]+)s$ ]]; then h=${BASH_REMATCH[1]}; sec=${BASH_REMATCH[2]}
+            elif [[ "$s" =~ ^([0-9]+)h$ ]]; then h=${BASH_REMATCH[1]}
+            elif [[ "$s" =~ ^([0-9]+)m$ ]]; then m=${BASH_REMATCH[1]}
+            elif [[ "$s" =~ ^([0-9]+)s$ ]]; then sec=${BASH_REMATCH[1]}
+            elif [[ "$s" =~ ^[0-9]+$ ]]; then sec=$s
+            else echo "$s"; return; fi
+            printf "%02d:%02d:%02d" "$h" "$m" "$sec"
+          }
+
+          N_START="$(norm_time "$START_AT")"
+          N_DUR="$(norm_time "$DURATION")"
+
+          # Lấy tên file sạch
           NAME="$(yt-dlp --print "%(uploader)s_%(title).180B_%(id)s" "$URL" | head -n1)"
           SAFE="$(printf '%s' "$NAME" | tr -d '\n' | sed 's#[/<>:"\\|?*]#_#g')"
-          OUT="out_final/${SAFE}.mp4"
-          echo "[INFO] Output file: $OUT"
 
+          # Lấy URL thấp nhất (tải nhanh)
           mapfile -t RAW_URLS < <(yt-dlp -g -f "worst" "$URL")
-          if [ "${#RAW_URLS[@]}" -eq 0 ]; then
-            echo "Không lấy được URL HLS từ Twitch"; exit 1
-          fi
+          [ "${#RAW_URLS[@]}" -ge 1 ] || { echo "Không lấy được URL HLS từ Twitch"; exit 1; }
           SRC="${RAW_URLS[0]}"
+
+          SS_ARGS=(); T_ARGS=()
+          if [[ "$N_START" != "0" ]]; then SS_ARGS=(-ss "$N_START"); fi
+          if [[ "$N_DUR"   != "0" ]]; then T_ARGS=(-t "$N_DUR"); fi
+
           echo "[INFO] Source (worst): $SRC"
+          echo "[INFO] Start: $N_START | Duration: $N_DUR | Strategy: $UPLOAD_STRATEGY"
 
-          SS_ARGS=()
-          T_ARGS=()
-          if [[ -n "$START_AT" && "$START_AT" != "0" && "$START_AT" != "00:00:00" ]]; then
-            SS_ARGS=(-ss "$START_AT")
+          if [ "$UPLOAD_STRATEGY" = "segments" ]; then
+            # Xuất phân đoạn để upload dễ, chống 429
+            SEG_MIN=${SEGMENT_MIN:-10}
+            [[ "$SEG_MIN" =~ ^[0-9]+$ ]] || SEG_MIN=10
+            SEG_SEC=$((SEG_MIN*60))
+            echo "[INFO] Segment mỗi ${SEG_MIN} phút (${SEG_SEC}s)"
+            # đặt pattern tên part
+            OUTPATTERN="out_final/${SAFE}.part%03d.mp4"
+            # encode + segment trực tiếp (moov đầu, keyframe đều)
+            ffmpeg -hide_banner -loglevel info -stats \
+              "${SS_ARGS[@]}" -i "$SRC" \
+              "${T_ARGS[@]}" \
+              -vf "scale=-2:480,fps=30" \
+              -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 24 \
+              -c:a aac -b:a 128k -ac 2 -ar 48000 \
+              -movflags +faststart \
+              -force_key_frames "expr:gte(t,n_forced*2)" \
+              -max_muxing_queue_size 1024 \
+              -f segment \
+              -segment_time ${SEG_SEC} \
+              -reset_timestamps 1 \
+              "$OUTPATTERN"
+          else
+            # single file
+            OUT="out_final/${SAFE}.mp4"
+            ffmpeg -hide_banner -loglevel info -stats \
+              "${SS_ARGS[@]}" -i "$SRC" \
+              "${T_ARGS[@]}" \
+              -vf "scale=-2:480,fps=30" \
+              -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 24 \
+              -c:a aac -b:a 128k -ac 2 -ar 48000 \
+              -movflags +faststart \
+              -max_muxing_queue_size 1024 \
+              "$OUT"
           fi
-          if [[ -n "$DURATION" && "$DURATION" != "0" ]]; then
-            T_ARGS=(-t "$DURATION")
-          fi
-
-          ffmpeg -hide_banner -loglevel info -stats \
-            "${SS_ARGS[@]}" -i "$SRC" \
-            "${T_ARGS[@]}" \
-            -vf "scale=-2:480,fps=30" \
-            -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 24 \
-            -c:a aac -b:a 128k -ac 2 -ar 48000 \
-            -movflags +faststart \
-            -max_muxing_queue_size 1024 \
-            "$OUT"
 
           ls -lh out_final
 
-      - name: Upload to Drive (Anti-429 Optimized)
+      - name: Upload to Drive (robust, progress, anti-429)
         if: ${{ steps.pick.outputs.selected_url != '' }}
+        shell: bash
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
-        shell: bash
+          UPLOAD_STRATEGY: ${{ env.UPLOAD_STRATEGY }}
         run: |
           set -euo pipefail
-          echo "⏳ Chờ 5 phút trước upload để tránh Google rate-limit..."
-          sleep 300
+          # Cờ upload "lịch sự"
+          RFLAGS="--transfers 1 --checkers 1 --tpslimit 0.5 --tpslimit-burst 1 --drive-chunk-size 16M --stats 10s --progress --retries 1 --low-level-retries 10 --disable-http2"
 
-          UPLOAD_DIR="out_final"
-          MAX_RETRY=10
-          RETRY=0
-          DELAY=120
+          if [ "$UPLOAD_STRATEGY" = "segments" ]; then
+            echo "[UPLOAD] Chế độ segments"
+            shopt -s nullglob
+            for f in out_final/*.mp4; do
+              base="$(basename "$f")"
+              echo "→ Upload: $base"
+              # retry tăng dần cho từng part
+              for i in 1 2 3 4 5 6 7 8; do
+                rclone copyto "$f" "gdrive:$base" $RFLAGS && break
+                SLEEP=$((i*45))
+                echo "[WARN] lỗi (có thể 429), chờ ${SLEEP}s rồi thử lại part này..."
+                sleep "$SLEEP"
+                if [ "$i" -eq 8 ]; then
+                  echo "[FATAL] Part $base upload mãi không được."; exit 1
+                fi
+              done
+              rm -f "$f"
+            done
+            rmdir out_final || true
+          else
+            echo "[UPLOAD] Chế độ single"
+            f=(out_final/*.mp4)
+            [ -f "${f[0]-}" ] || { echo "Không thấy file để upload"; exit 1; }
+            src="${f[0]}"
+            tmpremote="gdrive:$(basename "$src").uploading"
+            finalremote="gdrive:$(basename "$src")"
 
-          while [ $RETRY -lt $MAX_RETRY ]; do
-            echo "🚀 Upload lần $((RETRY+1)) (retry delay hiện tại: $DELAY giây)..."
+            # Up vào tên .uploading để tránh trùng/danh sách phình to khi retry
+            for i in 1 2 3 4 5 6 7 8; do
+              rclone copyto "$src" "$tmpremote" $RFLAGS && break
+              SLEEP=$((i*60))
+              echo "[WARN] lỗi (có thể 429), chờ ${SLEEP}s rồi thử lại..."
+              sleep "$SLEEP"
+              if [ "$i" -eq 8 ]; then
+                echo "[FATAL] Upload single file mãi không được."; exit 1
+              fi
+            done
 
-            rclone copy "$UPLOAD_DIR" "gdrive:" \
-              --transfers 1 \
-              --checkers 1 \
-              --bwlimit 8M \
-              --tpslimit 0.5 \
-              --tpslimit-burst 1 \
-              --drive-chunk-size 8M \
-              --drive-upload-cutoff 8M \
-              --max-backlog 1 \
-              --stats 30s \
-              --retries 3 \
-              --low-level-retries 20 \
-              --timeout 1h \
-              --contimeout 5m \
-              --progress
-
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "🎉 Upload hoàn tất thành công!"
-              rm -rf "$UPLOAD_DIR"
-              break
-            else
-              echo "⚠️ Upload lỗi (mã $EXIT_CODE). Ngủ $DELAY giây rồi thử lại..."
-              sleep $DELAY
-              RETRY=$((RETRY+1))
-              DELAY=$((DELAY * 2))  # tăng delay theo cấp số nhân
-            fi
-          done
-
-          if [ $RETRY -eq $MAX_RETRY ]; then
-            echo "❌ Thất bại sau $MAX_RETRY lần thử upload." >&2
-            exit 1
+            # Đổi tên về file thật sau khi up xong
+            rclone moveto "$tmpremote" "$finalremote" --stats 5s --progress --disable-http2 || true
+            rm -rf out_final
           fi
 
       - name: Append processed link to linkdalay.csv & push
         if: ${{ steps.pick.outputs.selected_url != '' }}
-        env:
-          URL: ${{ steps.pick.outputs.selected_url }}
+        env: { URL: ${{ steps.pick.outputs.selected_url }} }
         run: |
           set -e
           grep -Fqx -- "$URL" linkdalay.csv || echo "$URL" >> linkdalay.csv
