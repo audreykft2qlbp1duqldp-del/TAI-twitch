@@ -1,4 +1,4 @@
-name: twitch_to_drive_default
+name: twitch_to_drive_720_single
 
 on:
   workflow_dispatch:
@@ -110,7 +110,7 @@ jobs:
           rclone mkdir "$TMP" --stats 5s --progress --disable-http2
           rclone purge "$TMP" || true
 
-      - name: Twitch → MP4 (worst, 480p@30fps) → phân đoạn 10 phút (anti-429)
+      - name: Twitch → MP4 720p (single file, clean)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
@@ -120,9 +120,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out_final
-          SEGMENT_MIN=10   # mặc định tối ưu
-          SEG_SEC=$((SEGMENT_MIN*60))
 
+          # Chuẩn hóa thời gian (chấp nhận 00:00:00 / 20m37s / 75s / 0)
           norm_time () {
             s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
             [ -z "$s" ] && { echo "0"; return; }
@@ -144,38 +143,54 @@ jobs:
           N_START="$(norm_time "$START_AT")"
           N_DUR="$(norm_time "$DURATION")"
 
+          # Tên file an toàn
           NAME="$(yt-dlp --print "%(uploader)s_%(title).180B_%(id)s" "$URL" | head -n1)"
           SAFE="$(printf '%s' "$NAME" | tr -d '\n' | sed 's#[/<>:"\\|?*]#_#g')"
+          OUT="out_final/${SAFE}.mp4"
+          echo "[INFO] Output: $OUT"
 
-          mapfile -t RAW_URLS < <(yt-dlp -g -f "worst" "$URL")
-          [ "${#RAW_URLS[@]}" -ge 1 ] || { echo "Không lấy được URL HLS từ Twitch"; exit 1; }
-          SRC="${RAW_URLS[0]}"
+          # 1) Thử lấy đúng 720p
+          mapfile -t URLS < <(yt-dlp -g -f "bv*[height=720]+ba/b[height=720]/best" "$URL")
+          # 2) Fallback: <=720p
+          if [ "${#URLS[@]}" -eq 0 ]; then
+            mapfile -t URLS < <(yt-dlp -g -f "bv*[height<=720]+ba/b[height<=720]/best" "$URL")
+          fi
+          [ "${#URLS[@]}" -ge 1 ] || { echo "Không lấy được stream 720p/<=720p từ Twitch"; exit 1; }
 
           SS_ARGS=(); T_ARGS=()
           if [[ "$N_START" != "0" ]]; then SS_ARGS=(-ss "$N_START"); fi
           if [[ "$N_DUR"   != "0" ]]; then T_ARGS=(-t "$N_DUR"); fi
 
-          OUTPATTERN="out_final/${SAFE}.part%03d.mp4"
-          echo "[INFO] Source: $SRC"
-          echo "[INFO] Start: $N_START | Duration: $N_DUR | Segment: ${SEGMENT_MIN}m"
+          # Encode 1 file duy nhất, 720p sạch, 30fps, H.264/AAC
+          if [ "${#URLS[@]}" -ge 2 ]; then
+            VURL="${URLS[0]}"; AURL="${URLS[1]}"
+            ffmpeg -hide_banner -loglevel info -stats \
+              "${SS_ARGS[@]}" -i "$VURL" "${SS_ARGS[@]}" -i "$AURL" \
+              -map 0:v:0 -map 1:a:0 \
+              "${T_ARGS[@]}" \
+              -vf "scale=-2:720,fps=30" \
+              -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 23 \
+              -c:a aac -b:a 128k -ac 2 -ar 48000 \
+              -movflags +faststart \
+              -max_muxing_queue_size 1024 \
+              "$OUT"
+          else
+            ONE="${URLS[0]}"
+            ffmpeg -hide_banner -loglevel info -stats \
+              "${SS_ARGS[@]}" -i "$ONE" \
+              -map 0:v:0 -map 0:a:0? \
+              "${T_ARGS[@]}" \
+              -vf "scale=-2:720,fps=30" \
+              -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 23 \
+              -c:a aac -b:a 128k -ac 2 -ar 48000 \
+              -movflags +faststart \
+              -max_muxing_queue_size 1024 \
+              "$OUT"
+          fi
 
-          ffmpeg -hide_banner -loglevel info -stats \
-            "${SS_ARGS[@]}" -i "$SRC" \
-            "${T_ARGS[@]}" \
-            -vf "scale=-2:480,fps=30" \
-            -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 24 \
-            -c:a aac -b:a 128k -ac 2 -ar 48000 \
-            -movflags +faststart \
-            -force_key_frames "expr:gte(t,n_forced*2)" \
-            -max_muxing_queue_size 1024 \
-            -f segment \
-            -segment_time ${SEG_SEC} \
-            -reset_timestamps 1 \
-            "$OUTPATTERN"
+          ls -lh "$OUT"
 
-          ls -lh out_final
-
-      - name: Upload segments to Drive (progress, anti-429)
+      - name: Upload single MP4 to Drive (robust)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
@@ -184,19 +199,22 @@ jobs:
           set -euo pipefail
           RFLAGS="--transfers 1 --checkers 1 --tpslimit 0.5 --tpslimit-burst 1 --drive-chunk-size 16M --stats 10s --progress --retries 1 --low-level-retries 10 --disable-http2"
 
-          shopt -s nullglob
-          for f in out_final/*.mp4; do
-            base="$(basename "$f")"
-            echo "Upload: $base"
-            for i in 1 2 3 4 5 6 7 8; do
-              rclone copyto "$f" "gdrive:$base" $RFLAGS && break
-              SLEEP=$((i*45)); echo "429? chờ ${SLEEP}s rồi thử lại part này..."
-              sleep "$SLEEP"
-              if [ "$i" -eq 8 ]; then echo "Upload part fail mãi."; exit 1; fi
-            done
-            rm -f "$f"
+          f=(out_final/*.mp4)
+          [ -f "${f[0]-}" ] || { echo "Không thấy file để upload"; exit 1; }
+          src="${f[0]}"
+          tmpremote="gdrive:$(basename "$src").uploading"
+          finalremote="gdrive:$(basename "$src")"
+
+          # Upload vào tên .uploading, xong mới rename → tránh rác/trùng khi retry
+          for i in 1 2 3 4 5 6 7 8; do
+            rclone copyto "$src" "$tmpremote" $RFLAGS && break
+            SLEEP=$((i*60)); echo "429? chờ ${SLEEP}s rồi thử lại..."
+            sleep "$SLEEP"
+            if [ "$i" -eq 8 ]; then echo "Upload fail mãi."; exit 1; fi
           done
-          rmdir out_final || true
+
+          rclone moveto "$tmpremote" "$finalremote" --stats 5s --progress --disable-http2 || true
+          rm -rf out_final
 
       - name: Append processed link to linkdalay.csv & push
         if: ${{ steps.pick.outputs.selected_url != '' }}
