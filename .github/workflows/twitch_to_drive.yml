@@ -92,7 +92,6 @@ jobs:
             [ -n "$GDRIVE_CLIENT_SECRET" ] && echo "client_secret = $GDRIVE_CLIENT_SECRET"
             echo "token = $TOKEN"
             [ -n "$GDRIVE_FOLDER_ID" ] && echo "root_folder_id = ${GDRIVE_FOLDER_ID}"
-            # nhịp chậm giảm 429
             echo "pacer_min_sleep = 1s"
             echo "pacer_burst = 1"
           } > rclone.conf
@@ -110,7 +109,7 @@ jobs:
           rclone mkdir "$TMP" --stats 5s --progress --disable-http2
           rclone purge "$TMP" || true
 
-      - name: Twitch → MP4 720p (single file, clean)
+      - name: Twitch → MP4 720p (single file, smaller size)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
@@ -121,7 +120,7 @@ jobs:
           set -euo pipefail
           mkdir -p out_final
 
-          # Chuẩn hóa thời gian (chấp nhận 00:00:00 / 20m37s / 75s / 0)
+          # Chuẩn hóa thời gian (00:00:00 / 20m37s / 75s / 0)
           norm_time () {
             s="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
             [ -z "$s" ] && { echo "0"; return; }
@@ -149,9 +148,8 @@ jobs:
           OUT="out_final/${SAFE}.mp4"
           echo "[INFO] Output: $OUT"
 
-          # 1) Thử lấy đúng 720p
+          # Ưu tiên 720p, fallback <=720p
           mapfile -t URLS < <(yt-dlp -g -f "bv*[height=720]+ba/b[height=720]/best" "$URL")
-          # 2) Fallback: <=720p
           if [ "${#URLS[@]}" -eq 0 ]; then
             mapfile -t URLS < <(yt-dlp -g -f "bv*[height<=720]+ba/b[height<=720]/best" "$URL")
           fi
@@ -161,16 +159,18 @@ jobs:
           if [[ "$N_START" != "0" ]]; then SS_ARGS=(-ss "$N_START"); fi
           if [[ "$N_DUR"   != "0" ]]; then T_ARGS=(-t "$N_DUR"); fi
 
-          # Encode 1 file duy nhất, 720p sạch, 30fps, H.264/AAC
+          # Encode 1 file duy nhất, 720p giữ nhỏ dung lượng
+          # - CRF 25 (nhỏ hơn CRF 23) + preset medium → file nhỏ hơn, thời gian encode tăng vừa phải
+          # - Audio 96k / 44.1k → giảm dung lượng mà vẫn nghe ổn
           if [ "${#URLS[@]}" -ge 2 ]; then
             VURL="${URLS[0]}"; AURL="${URLS[1]}"
             ffmpeg -hide_banner -loglevel info -stats \
               "${SS_ARGS[@]}" -i "$VURL" "${SS_ARGS[@]}" -i "$AURL" \
               -map 0:v:0 -map 1:a:0 \
               "${T_ARGS[@]}" \
-              -vf "scale=-2:720,fps=25" \
-              -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 25 \
-              -c:a aac -b:a 128k -ac 2 -ar 48000 \
+              -vf "scale=-2:720,fps=30" \
+              -c:v libx264 -preset medium -profile:v high -level 4.1 -pix_fmt yuv420p -crf 25 \
+              -c:a aac -b:a 96k -ac 2 -ar 44100 \
               -movflags +faststart \
               -max_muxing_queue_size 1024 \
               "$OUT"
@@ -180,9 +180,9 @@ jobs:
               "${SS_ARGS[@]}" -i "$ONE" \
               -map 0:v:0 -map 0:a:0? \
               "${T_ARGS[@]}" \
-              -vf "scale=-2:720,fps=25" \
-              -c:v libx264 -preset veryfast -profile:v high -level 4.1 -pix_fmt yuv420p -crf 25 \
-              -c:a aac -b:a 128k -ac 2 -ar 48000 \
+              -vf "scale=-2:720,fps=30" \
+              -c:v libx264 -preset medium -profile:v high -level 4.1 -pix_fmt yuv420p -crf 25 \
+              -c:a aac -b:a 96k -ac 2 -ar 44100 \
               -movflags +faststart \
               -max_muxing_queue_size 1024 \
               "$OUT"
@@ -190,27 +190,37 @@ jobs:
 
           ls -lh "$OUT"
 
-      - name: Upload single MP4 to Drive (robust)
+      - name: Upload single MP4 to Drive (robust+anti-429)
         if: ${{ steps.pick.outputs.selected_url != '' }}
         shell: bash
         env:
           RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
         run: |
           set -euo pipefail
-          RFLAGS="--transfers 1 --checkers 1 --tpslimit 0.5 --tpslimit-burst 1 --drive-chunk-size 16M --stats 10s --progress --retries 1 --low-level-retries 10 --disable-http2"
+          RFLAGS="--transfers 1 --checkers 1 \
+                  --tpslimit 0.25 --tpslimit-burst 1 \
+                  --drive-chunk-size 8M \
+                  --stats 15s --progress \
+                  --retries 1 --low-level-retries 20 \
+                  --timeout 10m --contimeout 1m --expect-continue-timeout 2m \
+                  --disable-http2"
 
           f=(out_final/*.mp4)
-          [ -f "${f[0]-}" ] || { echo "Không thấy file để upload"; exit 1; }
+          [ -f "${f[0]-}" ] || { echo 'Không thấy file để upload'; exit 1; }
           src="${f[0]}"
           tmpremote="gdrive:$(basename "$src").uploading"
           finalremote="gdrive:$(basename "$src")"
 
-          # Upload vào tên .uploading, xong mới rename → tránh rác/trùng khi retry
-          for i in 1 2 3 4 5 6 7 8; do
-            rclone copyto "$src" "$tmpremote" $RFLAGS && break
-            SLEEP=$((i*60)); echo "429? chờ ${SLEEP}s rồi thử lại..."
-            sleep "$SLEEP"
-            if [ "$i" -eq 8 ]; then echo "Upload fail mãi."; exit 1; fi
+          SLEEPS=(60 90 120 180 240 300 420 600 900 1200)
+          attempt=0
+          until rclone copyto "$src" "$tmpremote" $RFLAGS; do
+            if [ $attempt -ge ${#SLEEPS[@]} ]; then
+              echo "[FATAL] Upload thất bại nhiều lần (có thể 429)."; exit 1
+            fi
+            wait=${SLEEPS[$attempt]}
+            echo "[WARN] Lỗi upload (có thể 429). Nghỉ ${wait}s rồi thử lại..."
+            sleep "$wait"
+            attempt=$((attempt+1))
           done
 
           rclone moveto "$tmpremote" "$finalremote" --stats 5s --progress --disable-http2 || true
