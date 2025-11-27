@@ -9,7 +9,7 @@ on:
         required: false
       duration:
         description: "Thời lượng cần lấy (vd: 01:30:00 / 20m37s / 0 = toàn bộ)"
-        default: "01:30:00"
+        default: "03:30:00"
         required: false
 
 jobs:
